@@ -14,9 +14,13 @@ all-notes-off and reset-controllers work. At most 64 voices: the oldest released
 import os, sys, time, math, struct
 
 RATE = 32000
+DRUM_SUB = {27: 37, 28: 39, 29: 75, 30: 75, 31: 37, 32: 37, 33: 76, 34: 53, 82: 70, 83: 54, 84: 81, 85: 75,
+            86: 64, 87: 64, 88: 49}
+STATS = dict(steals=0, steal_on=0, peak=0, silent={})          # voice use (tests)
 BLOCK = 512                   # 16 ms
 NBUF = 4
-MAX_VOICES = 64
+LOG_PATH = None                # the app's log file: a crash of the synth process is written there
+MAX_VOICES = 256              # (layered presets use 2+ voices per note; 64 dropped notes in dense songs)
 
 
 def _load_biquad():
@@ -37,7 +41,42 @@ def _load_biquad():
     return None
 
 
-def _synth_process(conn, sf_path, wav_path=None):
+def _load_voice():
+    """The C voice renderer (synth_voice in kecpu.dll / libkecpu.so), or None (then numpy renders)."""
+    import ctypes
+    names = ('kecpu.dll',) if os.name == 'nt' else ('libkecpu.so',)
+    dirs = [os.path.dirname(os.path.abspath(__file__))]
+    if getattr(sys, '_MEIPASS', None): dirs.insert(0, sys._MEIPASS)
+    if getattr(sys, 'frozen', False): dirs.append(os.path.dirname(sys.executable))
+    for d in dirs:
+        for n in names:
+            try:
+                lib = ctypes.CDLL(os.path.join(d, n)); f = lib.synth_voice
+                f.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p,
+                              ctypes.c_void_p, ctypes.c_void_p]
+                f.restype = ctypes.c_int32
+                return f
+            except (OSError, AttributeError):
+                continue
+    return None
+
+
+def _synth_process(conn, sf_path, wav_path=None, log_path=None):
+    try:
+        _synth_main(conn, sf_path, wav_path)
+    except (KeyboardInterrupt, SystemExit, EOFError, BrokenPipeError):
+        return                                      # the program is closing: not an error
+    except BaseException:
+        import traceback, time as _t
+        if log_path:
+            try:
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.write('%s SYNTH ERROR (SoundFont %s)\n%s\n' % (_t.strftime('%H:%M:%S'), os.path.basename(sf_path), traceback.format_exc()))
+            except Exception: pass
+        raise
+
+
+def _synth_main(conn, sf_path, wav_path=None):
     try:
         import winperf; winperf.process('high'); winperf.thread('highest')    # audio: never 'efficiency mode'
     except Exception:
@@ -50,6 +89,7 @@ def _synth_process(conn, sf_path, wav_path=None):
     ar_full = np.arange(BLOCK, dtype=np.float64)
     import ctypes
     biquad = None if os.environ.get('KE_NOFILTER') else _load_biquad()
+    cvoice = None if os.environ.get('KE_PYSYNTH') else _load_voice()     # whole voices in C: ~20x faster
     out_dev = _WaveOut() if sys.platform == 'win32' and not wav_path else None
     wav = open(wav_path, 'wb') if wav_path else None
     if wav: wav.write(b'\0' * 44)
@@ -59,6 +99,7 @@ def _synth_process(conn, sf_path, wav_path=None):
                      drum=(c == 9), rpn=None, mod=0)
                 for c in range(16)]
     chans = reset_channels()
+    lim = [MAX_VOICES]; light = [False]; load = [0.0]  # voice limit / filters off, lowered on a slow computer
     voices = []                                      # dicts
     clock = 0                                        # samples rendered
 
@@ -67,8 +108,30 @@ def _synth_process(conn, sf_path, wav_path=None):
         pk = key if C['drum'] else min(127, max(0, key + int(ctl['transpose'])))     # the key that sounds
         ov = ctl['prog'][c] if c < len(ctl['prog']) else -1                           # instrument chosen in the panel
         bank, prog = (ov // 128, ov % 128) if ov is not None and ov >= 0 else (C['bank'], C['prog'])
-        for r in sf.regions(bank, prog):
-            if not (r['kr'][0] <= pk <= r['kr'][1] and r['vr'][0] <= vel <= r['vr'][1]): continue
+        nv0 = len(voices)
+        # the same key again on this channel: the earlier note goes to its release (as on the chip) instead of
+        # piling up voices - dense songs otherwise ran out of voices and long notes were cut off
+        for v in voices:
+            if v['ch'] == c and v['key'] == key and v['rel_t'] is None:
+                v['on'] = False; v['held'] = False; v['rel_t'] = v['t']; v['rel_lvl'] = v['lvl']
+        regs = [r for r in sf.regions(bank, prog) if r['vr'][0] <= vel <= r['vr'][1]]
+        hit = [r for r in regs if r['kr'][0] <= pk <= r['kr'][1]]
+        if not hit and C['drum']:
+            # GS drum notes this SoundFont's kits lack (27-34, 82-88: high Q, slap, scratch, sticks, metronome,
+            # shaker, jingle bell, bell tree, castanets, surdo): the closest sound it has, so the part is not
+            # left with holes. Then the standard kit if the chosen kit has no sample for the key.
+            for k2 in (pk, DRUM_SUB.get(pk, pk)):
+                hit = [r for r in regs if r['kr'][0] <= k2 <= r['kr'][1]]
+                if not hit and prog != 0:
+                    hit = [r for r in sf.regions(128, 0) if r['vr'][0] <= vel <= r['vr'][1] and r['kr'][0] <= k2 <= r['kr'][1]]
+                if hit: pk = k2; break
+        if not hit and regs and not C['drum']:
+            # a key above / below every sample of the instrument: the nearest one, transposed (the chip plays these;
+            # before, such notes were silent)
+            dist = lambda r: r['kr'][0] - pk if pk < r['kr'][0] else pk - r['kr'][1]
+            best = min(dist(r) for r in regs)
+            if best <= 24: hit = [r for r in regs if dist(r) == best]
+        for r in hit:
             s = r['s']; g = r['g']
             gv = lambda name: g.get(GEN[name], _default(GEN[name]))
             start = s['start'] + gv('startAddrsOffset') + 32768 * gv('startAddrsCoarseOffset')
@@ -92,7 +155,9 @@ def _synth_process(conn, sf_path, wav_path=None):
                      on=True)
             # low-pass filter (most of this SoundFont's instruments are filtered; unfiltered they sound harsh and
             # shrill) with its modulation envelope, and the vibrato / modulation LFOs on pitch
-            fc = gv('initialFilterFc') - 2400 * (127 - vel) / 127.0      # SF2 default modulator: softer = darker
+            # (no velocity-to-cutoff modulator: with it, soft notes of the darker instruments of this SoundFont were
+            # filtered almost to silence - heard as missing / muted instruments)
+            fc = gv('initialFilterFc')
             v.update(fc=fc, fq=gv('initialFilterQ'), me_fc=gv('modEnvToFilterFc'), me_p=gv('modEnvToPitch'),
                      mdly=_tc(gv('delayModEnv')), matt=_tc(gv('attackModEnv')), mhold=_tc(gv('holdModEnv')),
                      mdec=_tc(gv('decayModEnv')), msus=1.0 - min(max(gv('sustainModEnv'), 0), 1000) / 1000.0,
@@ -102,13 +167,23 @@ def _synth_process(conn, sf_path, wav_path=None):
                      md=_tc(gv('delayModLFO')), z=(ctypes.c_double * 2)(), filt=None)
             v['filt'] = biquad is not None and (fc < 13400 or v['me_fc'] > 0 or v['mlf'] != 0)
             voices.append(v)
-        while len(voices) > MAX_VOICES:                # drop the oldest released voice, else the oldest
+        if len(voices) == nv0:
+            k = (c, bank, prog, pk, vel); STATS.setdefault('silent', {})[k] = STATS['silent'].get(k, 0) + 1
+        STATS['peak'] = max(STATS['peak'], len(voices))
+        while len(voices) > lim[0]:                # drop the oldest released voice, else the oldest
             rel = [v for v in voices if v['rel_t'] is not None]
-            voices.remove(rel[0] if rel else voices[0])
+            x = min(rel, key=lambda v: v['lvl']) if rel else voices[0]      # the quietest fading note first
+            STATS['steals'] += 1; STATS['steal_on'] += 0 if rel else 1
+            if not rel: STATS.setdefault('stolen_ch', []).append(x['ch'])
+            voices.remove(x)
 
     def note_off(c, key):
+        drum = chans[c]['drum']
         for v in voices:
             if v['ch'] == c and v['key'] == key and v['on']:
+                # drum parts ignore note-off (GS Rx.NoteOff off, as on the SAM2695): a hit plays its whole sample.
+                # Released at once, drums with short notes were nearly silent ("muted" kick / snare in some songs)
+                if drum and not v.get('looped'): continue
                 v['on'] = False
                 if chans[c]['sustain']: v['held'] = True
                 elif v['rel_t'] is None: v['rel_t'] = v['t']; v['rel_lvl'] = v['lvl']
@@ -179,7 +254,52 @@ def _synth_process(conn, sf_path, wav_path=None):
         elif kind == 0xC0: C['prog'] = a
         elif kind == 0xE0: C['bend'] = ((b << 7) | a) - 8192
 
+    D2 = ctypes.c_double
+    smp_ptr = None
+    def render_part_c(N):
+        nonlocal smp_ptr
+        if smp_ptr is None: smp_ptr = smp.ctypes.data
+        buf = np.zeros(N * 2, np.float32); bp = buf.ctypes.data
+        dead = []
+        for v in voices:
+            C = chans[v['ch']]
+            tb = v['t']
+            if v['rel_t'] is None:
+                a0 = v['mdly']; a1 = a0 + v['matt']; h1 = a1 + v['mhold']; d1 = h1 + v['mdec']
+                me = 0.0 if tb < a0 else (tb - a0) / max(v['matt'], 1e-9) if tb < a1 else 1.0 if tb < h1 else \
+                     1 - (1 - v['msus']) * (tb - h1) / max(v['mdec'], 1e-9) if tb < d1 else v['msus']
+                v['mlvl'] = me
+            else:
+                me = v.get('mlvl', 0.0) * max(0.0, 1 - (tb - v['rel_t']) / v['mrel'])
+            lfo_v = math.sin(2 * math.pi * v['vf'] * (tb - v['vd'])) if tb > v['vd'] else 0.0
+            lfo_m = math.sin(2 * math.pi * v['mf'] * (tb - v['md'])) if tb > v['md'] else 0.0
+            cents = (v['vib'] + C['mod'] * 50 / 127.0) * lfo_v + v['mlp'] * lfo_m + v['me_p'] * me
+            step = v['base_step'] * 2.0 ** (C['bend'] / 8192 * C['brange'] / 12.0 + cents / 1200.0)
+            amp = v['atten'] * (v['vel'] / 127.0) ** 2 * (C['vol'] / 127.0) ** 2 * (C['expr'] / 127.0) ** 2
+            amp *= 0.0 if ctl['mute'][v['ch']] else ctl['chvol'][v['ch']]
+            pan = min(max((C['pan'] - 64) / 64.0 + v['pan_off'], -1), 1)
+            f_on = 0.0; cf = (0.0, 0.0, 0.0, 0.0, 0.0)
+            if v['filt'] and ctl['filter'] and not light[0]:
+                fcc = min(max(v['fc'] + v['me_fc'] * me + v['mlf'] * lfo_m, 1500.0), 13500.0)
+                f = min(8.176 * 2.0 ** (fcc / 1200.0), 0.45 * RATE)
+                q = max(0.5, 0.7071 * 10 ** (v['fq'] / 200.0))
+                w0 = 2 * math.pi * f / RATE; cs = math.cos(w0); al = math.sin(w0) / (2 * q); a0n = 1 + al
+                cf = ((1 - cs) / 2 / a0n, (1 - cs) / a0n, (1 - cs) / 2 / a0n, -2 * cs / a0n, (1 - al) / a0n); f_on = 1.0
+            st_ = (D2 * 3)(v['pos'], v['t'], v['lvl'])
+            prm = (D2 * 23)(step, v['end'], v['ls'], v['le'], 1.0 if v['looped'] else 0.0, v['dly'], v['att'], v['hold'],
+                             v['dec'], v['sus'], v['rel'], -1.0 if v['rel_t'] is None else v['rel_t'], v['rel_lvl'], amp,
+                             math.cos((pan + 1) * math.pi / 4), math.sin((pan + 1) * math.pi / 4), float(RATE), f_on, *cf)
+            got = cvoice(smp_ptr, nsmp, bp, N, ctypes.addressof(st_), ctypes.addressof(prm), ctypes.addressof(v['z']))
+            v['pos'], v['t'], v['lvl'] = st_[0], st_[1], st_[2]
+            if got < N: dead.append(v)
+        for v in dead:
+            if v in voices: voices.remove(v)
+        mix = buf.reshape(N, 2)
+        mix *= 0.5 * master[0] * ctl['master']
+        return mix
+
     def render_part(N):
+        if cvoice is not None: return render_part_c(N)
         ar = ar_full[:N]
         mix = np.zeros((N, 2), np.float32)
         dead = []
@@ -222,7 +342,7 @@ def _synth_process(conn, sf_path, wav_path=None):
             amp *= 0.0 if ctl['mute'][v['ch']] else ctl['chvol'][v['ch']]
             pan = min(max((C['pan'] - 64) / 64.0 + v['pan_off'], -1), 1)
             sig = wave * env * amp
-            if v['filt'] and ctl['filter'] and n:
+            if v['filt'] and ctl['filter'] and not light[0] and n:
                 fcc = min(max(v['fc'] + v['me_fc'] * me + v['mlf'] * lfo_m, 1500.0), 13500.0)
                 f = min(8.176 * 2.0 ** (fcc / 1200.0), 0.45 * RATE)
                 q = max(0.5, 0.7071 * 10 ** (v['fq'] / 200.0))             # initialFilterQ: cB of resonance
@@ -243,28 +363,39 @@ def _synth_process(conn, sf_path, wav_path=None):
 
     # Timing: a message stamped with the sender's clock (the emulated player's seconds) is played exactly that far
     # from the previous ones, LATENCY after its first arrival; unstamped messages play at the next sample.
-    LATENCY = int(0.04 * RATE)
+    LATENCY = int(0.03 * RATE)
+    SLACK_LATE = int(0.06 * RATE); SLACK_EARLY = int(0.06 * RATE)
     sched = []                                       # (due sample, order, message)
     offset = [None]; order = [0]
     def schedule(t, m):
         if t is None: due = clock
         else:
             due = int(t * RATE) + offset[0] if offset[0] is not None else None
-            if due is None or due < clock - int(0.25 * RATE) or due > clock + RATE:
-                offset[0] = clock + LATENCY - int(t * RATE); due = int(t * RATE) + offset[0]   # (re)lock the clocks
+            # (Re)lock when a message would play clearly late, or clearly later than it needs to. The upper bound
+            # was 1 s: after the emulator fell behind for a moment the clocks re-locked late, and when it caught up
+            # again the music stayed up to a second behind the lyrics for the rest of the song.
+            if due is None or due < clock - SLACK_LATE or due > clock + LATENCY + SLACK_EARLY:
+                offset[0] = clock + LATENCY - int(t * RATE); due = int(t * RATE) + offset[0]
             due = max(due, clock)
         order[0] += 1; sched.append((due, order[0], m))
 
     streams = []                                     # recorded audio (song chorus clips) being mixed in
     def mix_streams(out, clk0):
         g = 0.8 * ctl['pcm'] * ctl['master']
-        for st_ in list(streams):
+        done = []
+        for k, st_ in enumerate(streams):
             start = max(clk0, st_['due']); a = st_['a']
             if start >= clk0 + BLOCK: continue
             src = start - st_['due']
-            if src >= len(a): streams.remove(st_); continue
+            if src >= len(a):
+                # a stream's piece may still come (late): kept 2 s so it goes on from there, not skipped
+                if st_.get('sid') is None or clk0 - (st_['due'] + len(a)) > 2 * RATE: done.append(k)
+                continue
             n = min(clk0 + BLOCK - start, len(a) - src)
             out[start - clk0:start - clk0 + n] += a[src:src + n] * g
+        # (by position: list.remove compares the dicts, and so their sample arrays, which raised an error and
+        # stopped the whole synth as soon as two clips of different lengths were playing)
+        for k in reversed(done): del streams[k]
 
     def render_block():
         nonlocal clock
@@ -292,10 +423,41 @@ def _synth_process(conn, sf_path, wav_path=None):
                 return
             t, m = msg
             if t == 'pcm':                                  # recorded audio to mix in: (seconds, 16-bit stereo bytes)
-                ts, raw = m
+                ts, raw = m[0], m[1]; sid = m[2] if len(m) > 2 else None
                 a = np.frombuffer(raw, dtype='<i2').astype(np.float32).reshape(-1, 2) / 32768.0
                 due = (int(ts * RATE) + offset[0]) if (ts is not None and offset[0] is not None) else clock + LATENCY
-                streams.append(dict(due=due, a=a)); continue
+                if sid is not None:
+                    # a piece of a stream already known: straight after its previous piece, whatever its time
+                    # stamp says (timing jitter left sample gaps / overlaps there: crackle). A stream that ran dry
+                    # (the next piece came late) goes on from now, faded in, instead of skipping into the piece
+                    st_ = next((x for x in streams if x.get('sid') == sid), None)
+                    if st_ is not None:
+                        end = st_['due'] + len(st_['a'])
+                        if end > clock:
+                            played = clock - st_['due']
+                            if played > 0: st_['a'] = st_['a'][played:]; st_['due'] += played
+                            st_['a'] = np.concatenate((st_['a'], a))
+                            continue
+                        del streams[next(i for i, x in enumerate(streams) if x is st_)]; due = max(due, clock + 64)
+                        n = min(len(a), 96); a = a.copy(); a[:n] *= np.linspace(0.0, 1.0, n, dtype=np.float32)[:, None]
+                    elif due < clock:
+                        cut = clock - due                               # first piece late: skip what is past
+                        if cut >= len(a): continue
+                        a = a[cut:]; due = clock
+                    streams.append(dict(due=due, a=a, sid=sid))
+                    continue
+                # a piece that continues a stream still playing (streamed sound comes in 20 ms pieces) is joined to
+                # it: no click from a sample gap / overlap where two pieces meet, and nothing is skipped when a piece
+                # arrives a little late
+                for st_ in streams:
+                    end = st_['due'] + len(st_['a'])
+                    if abs(due - end) <= 64 and end > clock:
+                        played = clock - st_['due']
+                        if played > 0: st_['a'] = st_['a'][played:]; st_['due'] += played
+                        st_['a'] = np.concatenate((st_['a'], a)); break
+                else:
+                    streams.append(dict(due=due, a=a))
+                continue
             if t == 'pcmstop':
                 streams.clear(); continue
             if t == 'ctl':
@@ -303,7 +465,16 @@ def _synth_process(conn, sf_path, wav_path=None):
                     if k in ctl: ctl[k] = list(val)[:16] if isinstance(ctl[k], list) else val
                 continue
             schedule(t, m)
+        t_r = time.perf_counter()
         data = render_block()
+        load[0] = 0.95 * load[0] + 0.05 * (time.perf_counter() - t_r) / (BLOCK / RATE)
+        # a slow computer: when rendering takes most of the real time, play fewer voices (oldest first) and skip
+        # the filters, so the sound stays in time instead of falling behind; back up when there is room again
+        if load[0] > 0.6 and lim[0] > 24:
+            lim[0] = max(24, int(lim[0] * 0.75)); light[0] = True; load[0] = 0.45
+        elif load[0] < 0.25 and lim[0] < MAX_VOICES:
+            lim[0] = min(MAX_VOICES, lim[0] + 8)
+            if lim[0] >= MAX_VOICES: light[0] = False
         if out_dev: out_dev.write(data)                 # waits while all buffers are playing
         else:
             if wav: wav.write(data)
@@ -371,7 +542,8 @@ class LiveSynth:
         self.conn, child = ctx.Pipe()
         import threading
         self._lock = threading.Lock()                 # the pipe is written from several threads (MIDI, chorus, panel)
-        self.proc = ctx.Process(target=_synth_process, args=(child, sf_path, wav_path or os.environ.get('KE_SYNTH_WAV')), daemon=True)
+        self.sf_path = sf_path; self.wav_path = wav_path; self._ctx = ctx; self._restarted = 0.0
+        self.proc = ctx.Process(target=_synth_process, args=(child, sf_path, wav_path or os.environ.get('KE_SYNTH_WAV'), LOG_PATH), daemon=True)
         self.proc.start()
         if not self.conn.poll(60): raise RuntimeError('the SoundFont synthesizer did not start')
         tag, self.sf_name = self.conn.recv()
@@ -379,15 +551,32 @@ class LiveSynth:
     def send(self, msg, t=None):
         try:
             with self._lock: self.conn.send((t, bytes(msg)))
-        except Exception: pass
+        except Exception:
+            self._revive()
+
+    def _revive(self):
+        """The synth process has gone (its error is in the log): start a new one, at most every 5 s."""
+        import time as _t, threading as _th
+        if self.proc.is_alive() or _t.time() - self._restarted < 5: return
+        self._restarted = _t.time()
+        def go():
+            try:
+                with self._lock:
+                    self.conn, child = self._ctx.Pipe()
+                    self.proc = self._ctx.Process(target=_synth_process, args=(child, self.sf_path, self.wav_path, LOG_PATH), daemon=True)
+                    self.proc.start()
+                if self.conn.poll(60): self.conn.recv()
+            except Exception: pass
+        _th.Thread(target=go, daemon=True).start()
 
     def reset(self):
         self.send(b'\xff')
 
-    def pcm(self, t, raw):
-        """Mix recorded audio (16-bit stereo at RATE) in, starting at sender time t."""
+    def pcm(self, t, raw, sid=None):
+        """Mix recorded audio (16-bit stereo at RATE) in, starting at sender time t. Pieces with the same sid are
+        one stream: played back to back, sample-continuous."""
         try:
-            with self._lock: self.conn.send(('pcm', (t, bytes(raw))))
+            with self._lock: self.conn.send(('pcm', (t, bytes(raw), sid)))
         except Exception: pass
 
     def pcm_stop(self):

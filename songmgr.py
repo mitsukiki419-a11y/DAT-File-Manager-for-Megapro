@@ -427,6 +427,7 @@ dialog{border:1px solid var(--line);border-radius:12px;background:var(--card);co
  <div class="note">Chorus: an audio file of recorded voices to play along (an audio file named like the MIDI, or "&lt;name&gt; chorus", is picked automatically), and when it starts (seconds into the song).</div>
  <div class="row"><span class="grow"></span><button class="sec" id="addcancel">Cancel</button><button id="addok">Add to disc</button></div>
 </dialog>
+<footer style="text-align:center;color:var(--mut);font-size:12px;padding:18px 12px 22px;border-top:1px solid var(--line);margin-top:18px">Megapro Song Manager by <b style="color:var(--ink)">ChiakiMK</b> · built with Claude (Anthropic)</footer>
 <script>
 const TOKEN="__TOKEN__";const $=id=>document.getElementById(id);
 async function api(path,body){const o={headers:{'X-Token':TOKEN}};if(body!==undefined){o.method='POST';o.body=JSON.stringify(body);o.headers['Content-Type']='application/json'}
